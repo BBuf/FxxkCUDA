@@ -62,7 +62,9 @@ __device__ T BlockReduce(T val, T* shm){
     const int32_t lane_idx = threadIdx.x % kWarpSize; 
 
     T warp_reduce_sum = WarpReduce<T>(val); 
-    shm[warp_idx] = warp_reduce_sum; 
+    if(lane_idx == 0){
+        shm[warp_idx] = warp_reduce_sum; 
+    }
     __syncthreads();
     T sum_val = (threadIdx.x < blockDim.x / kWarpSize) ? shm[lane_idx] : T(0.0); 
     if(warp_idx == 0){
