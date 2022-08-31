@@ -80,3 +80,72 @@ CUDA执行单位还是warp，每32个线程构成一个warp。而CUDA自身也�
 
 2. 启动两次Kernel，第一次Kernel reduce得到block个部分和结果。然后再启动一个只有1个block的kernel，做最终的求和
 
+
+### topic2: CoalescedAccess
+
+合并访存
+
+学习CUDA的人肯定会经常听到这个词，这篇就想简单谈下访存的几个点
+
+### 基础概念
+
+![](https://files.mdnice.com/user/4601/0a6e2301-f71b-417a-9233-d37ba793897f.png)
+
+CUDA在Global Memory上访问粒度是32B，而每32B组成一个sector，一个cacheline则对应4个sector，总共大小为128B
+
+
+而CUDA执行指令的单位是线程束，当发生一次访存的时候，其实是该线程束的所有线程执行访存操作。每个线程访存粒度可以是1B,2B,4B,8B,16B。下图表示的是每个线程访问了4B，一共访问了128B，即4个sector
+
+![](https://files.mdnice.com/user/4601/c8015403-380c-4c0c-9f23-1a19385e0280.png)
+
+可以看到最大访问粒度是16B=128bit，其实对应的指令就是ldg128，这也是向量化的基础。比如float类型，则可以用向量化的方式，以float4的格式一次性读4个float，减少指令数量，提高带宽
+
+### 什么是合并访存
+即一个线程束内的每个线程之间访问的地址需要是连续的，如上图所示
+
+而不合并访存则是每个线程之间访问的地址是不连续的。比如我一个线程束访问第0,32,64...1024这32个位置的float数据，那么一共访问了32*4B = 128B 的数据。但实际上，第0号线程为了访问第0个位置元素，则会启动一次内存事务，大小为32B。第1号线程访问第32个位置元素，由于该位置不在上一次内存事务覆盖的范围内，所以又要启动一次内存事务。
+
+这样一共启动了32次内存事务，32x32B = 1024B，实际只访问了128B数据。带宽利用率则为 128 / 1024 = 25%
+
+![](https://files.mdnice.com/user/4601/478b258f-06b6-48a1-a1db-26540e6e3fa0.png)
+
+### 向量化的错误做法导致的未合并访存
+由于基础不牢固，以前犯过这个错误，自己纠结了半天后面才想通。
+
+现在假设我们只有一个线程束（32个线程）要访问64个元素。
+
+如果你不用向量化，每个线程跨gridDim.x * blockDim.x来循环读取
+
+![](https://files.mdnice.com/user/4601/fc878bac-5534-4917-957d-13eaab0808c3.png)
+
+向量化的做法是每个线程用float2这个格式去访问，一次访问4B*2的数据，此时访存也是合并的。
+
+错误的做法则是一个线程访问连续的两个float，这会导致访存不连续。
+
+对应代码为：
+```cpp
+__global__ void AccessKernel(float* in, float* out, int64_t elem_cnt){
+    const int32_t idx = threadIdx.x; 
+    out[idx*2] = in[idx*2]; 
+    out[idx*2+1] = in[idx*2+1]; 
+}
+```
+
+下面简单解释一下
+
+在thread0访问第0号元素的时候，就发生了内存事务了，前面提到过内存事务大小是32B，这里float类型对应4个float。
+
+
+![](https://files.mdnice.com/user/4601/61041c50-2750-4a27-982f-594dc764cf92.png)
+
+
+那么可以看到一次内存事务包含的元素，其实只有thread0, thread1用到了。也就是说有一半都浪费了。
+
+我们计算下，一共64个float元素，只需要256B。而经过我们这么一浪费，实际上要花费512B的内存事务才能做到：
+
+![](https://files.mdnice.com/user/4601/fe2c145a-b52e-44e5-a06a-3840e295de8a.png)
+
+
+更多关于向量化的使用，我建议可以参考OneFlow的Elementwise模板，相关博客：https://zhuanlan.zhihu.com/p/447577193
+
+
