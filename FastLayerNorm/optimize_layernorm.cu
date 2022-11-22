@@ -165,6 +165,15 @@ union Pack<half, N> {
   half2 elem[N/2]; 
 };
 
+template<int N>
+union HalfPack {
+  __device__ HalfPack() {
+    // do nothing
+  }
+  uint4 storage;
+  half2 elem[N/2]; 
+};
+
 template<typename SRC, typename DST>
 struct DirectLoad {
   DirectLoad(const SRC* src, int64_t row_size) : src(src), row_size(row_size) {}
@@ -221,6 +230,44 @@ struct BiasAddResidualLoad {
   int64_t row_size;
 };
 
+// template<>
+// struct BiasAddResidualLoad<half, float> {
+//   BiasAddResidualLoad(const half* src, const half* bias, const half* residual, int64_t row_size) : src(src), bias(bias), residual(residual), row_size(row_size) {}
+//   template<int N>
+//   __device__ void load(float* dst, int64_t row, int64_t col) const {
+//     Pack<half, N> src_pack;
+//     Pack<half, N> res_pack;
+//     Pack<half, N> bias_pack;
+    
+//     // HalfPack<N> src_pack;
+//     // HalfPack<N> res_pack;
+//     // HalfPack<N> bias_pack;
+
+//     constexpr int32_t HALF2_PACKNUM = N / 2; 
+//     const int64_t offset = (row * row_size + col) / N;
+//     const int64_t bias_offset = col / N;
+//     src_pack.storage = *(reinterpret_cast<const PackType<half, N>*>(src) + offset);
+//     res_pack.storage = *(reinterpret_cast<const PackType<half, N>*>(residual) + offset);
+//     bias_pack.storage = *(reinterpret_cast<const PackType<half, N>*>(bias) + bias_offset);
+
+//     // src_pack.storage =  __ldlu(reinterpret_cast<const uint4*>(src) + offset);
+//     // res_pack.storage =  __ldlu(reinterpret_cast<const uint4*>(residual) + offset);
+//     // bias_pack.storage = __ldca(reinterpret_cast<const uint4*>(bias) + bias_offset);
+
+// #pragma unroll
+//     for (int i = 0; i < HALF2_PACKNUM; ++i) { 
+//       float2 tmp = __half22float2(src_pack.elem[i] + res_pack.elem[i] + bias_pack.elem[i]); 
+//       dst[i*2] = tmp.x; 
+//       dst[i*2 + 1] = tmp.y; 
+//     }
+//   }
+//   const half* src;
+//   const half* bias; 
+//   const half* residual;
+//   int64_t row_size;
+// };
+
+
 template<>
 struct BiasAddResidualLoad<half, float> {
   BiasAddResidualLoad(const half* src, const half* bias, const half* residual, int64_t row_size) : src(src), bias(bias), residual(residual), row_size(row_size) {}
@@ -229,15 +276,28 @@ struct BiasAddResidualLoad<half, float> {
     Pack<half, N> src_pack;
     Pack<half, N> res_pack;
     Pack<half, N> bias_pack;
-    constexpr int32_t HALF2_PACKSIZE = N / 2; 
+    
+    // HalfPack<N> src_pack;
+    // HalfPack<N> res_pack;
+    // HalfPack<N> bias_pack;
+
+    constexpr int32_t HALF2_PACKNUM = N / 2; 
     const int64_t offset = (row * row_size + col) / N;
     const int64_t bias_offset = col / N;
     src_pack.storage = *(reinterpret_cast<const PackType<half, N>*>(src) + offset);
-    res_pack.storage = *(reinterpret_cast<const PackType<half, N>*>(residual) + offset);
     bias_pack.storage = *(reinterpret_cast<const PackType<half, N>*>(bias) + bias_offset);
-#pragma unroll
-    for (int i = 0; i < HALF2_PACKSIZE; ++i) { 
-      float2 tmp = __half22float2(src_pack.elem[i] + res_pack.elem[i] + bias_pack.elem[i]); 
+    res_pack.storage = *(reinterpret_cast<const PackType<half, N>*>(residual) + offset);
+    #pragma unroll
+    for (int i = 0; i < N; ++i) { 
+      src_pack.elem[i] += res_pack.elem[i]; 
+    }
+    #pragma unroll
+    for (int i = 0; i < N; ++i) { 
+      src_pack.elem[i] += bias_pack.elem[i]; 
+    }
+    #pragma unroll
+    for (int i = 0; i < HALF2_PACKNUM; ++i) { 
+      float2 tmp = __half22float2(src_pack.elem[i]); 
       dst[i*2] = tmp.x; 
       dst[i*2 + 1] = tmp.y; 
     }
@@ -286,16 +346,23 @@ struct AffineStore<float, half> {
     Pack<half, N> y_pack;
     Pack<half, N> gamma_pack;
     Pack<half, N> beta_pack;
+
+    // HalfPack<N> gamma_pack;
+    // HalfPack<N> beta_pack;
+
     const int64_t offset = (row * row_size + col) / N;
     const int64_t gamma_offset = col / N;
     gamma_pack.storage =
         *(reinterpret_cast<const PackType<half, N>*>(gamma) + gamma_offset);
     beta_pack.storage =
         *(reinterpret_cast<const PackType<half, N>*>(beta) + gamma_offset);
+
+    // gamma_pack.storage =  __ldca(reinterpret_cast<const uint4*>(gamma) + gamma_offset);
+    // beta_pack.storage =  __ldca(reinterpret_cast<const uint4*>(beta) + gamma_offset);
+
 #pragma unroll
     for (int i = 0; i < N / 2; ++i) {
       half2 normalized_i = __float22half2_rn(reinterpret_cast<const float2*>(src)[i]); 
-      // static_cast<DST>(src[i]);
       y_pack.elem[i] = normalized_i * gamma_pack.elem[i] + beta_pack.elem[i];
     }
     *(reinterpret_cast<PackType<half, N>*>(y) + offset) = y_pack.storage;
@@ -383,22 +450,6 @@ __inline__ __device__ void WarpAllReduceSum2(T* mean, T* m2) {
 }
 
 
-// template<typename T, int thread_group_width = kWarpSize>
-// __inline__ __device__ void WarpReduceSum2(T mean, T m2) {
-//   for (int mask = thread_group_width / 2; mask > 0; mask /= 2) {
-//     mean += __shfl_down_sync(0xffffffff, mean, mask, thread_group_width); 
-//     m2 += __shfl_down_sync(0xffffffff, m2, mask, thread_group_width); 
-//   }
-// }
-
-// template<typename T, int thread_group_width = kWarpSize>
-// __inline__ __device__ void WarpAllReduceSum2(T thread_mean, T thread_m2, T* mean, T* m2) {
-//   WarpReduceSum2<T, thread_group_width>(thread_mean, thread_m2);
-//   *mean = __shfl_sync(0xffffffff, *mean, 0, thread_group_width);
-//   *m2 = __shfl_sync(0xffffffff, *m2, 0, thread_group_width);
-// }
-
-
 template<typename T>
 __inline__ __device__ void WelfordBlockAllReduce(T thread_mean, T thread_m2, T thread_count,
                                                  T* result_mean, T* result_m2, T* result_count) {
@@ -448,107 +499,17 @@ __inline__ __device__ void WelfordBlockAllReduce(T thread_mean, T thread_m2, T t
   *result_count = count_result_broadcast;
 }
 
-// template<typename LOAD, typename STORE, typename ComputeType, int pack_size,
-//          int max_cols_per_thread, int min_cols_per_thread, int thread_group_width,
-//          int rows_per_access, bool padding>
-// __global__ void LayerNormWarpImpl(LOAD load, STORE store, const int64_t rows, const int64_t cols,
-//                                   const double epsilon, ComputeType* mean,
-//                                   ComputeType* inv_variance) {
-//   static_assert(max_cols_per_thread % pack_size == 0, "");
-//   static_assert(min_cols_per_thread % pack_size == 0, "");
-//   static_assert(thread_group_width <= kWarpSize, "");
-//   static_assert(kWarpSize % thread_group_width == 0, "");
-//   constexpr int max_num_packs = max_cols_per_thread / pack_size;
-//   constexpr int min_num_packs = min_cols_per_thread / pack_size;
-//   assert(cols <= max_cols_per_thread * thread_group_width);
-//   ComputeType buf[rows_per_access][max_cols_per_thread];
-//   const int64_t global_thread_group_id = blockIdx.x * blockDim.y + threadIdx.y;
-//   const int64_t num_global_thread_group = gridDim.x * blockDim.y;
-//   const int64_t lane_id = threadIdx.x;
-//   const int64_t step = num_global_thread_group * rows_per_access;
-//   for (int64_t row = global_thread_group_id * rows_per_access; row < rows; row += step) {
-//     ComputeType thread_mean[rows_per_access];
-//     ComputeType thread_m2[rows_per_access];
-//     ComputeType thread_count[rows_per_access];
-// #pragma unroll
-//     for (int row_id = 0; row_id < rows_per_access; ++row_id) {
-//       thread_mean[row_id] = 0;
-//       thread_m2[row_id] = 0;
-//       thread_count[row_id] = 0;
-//       ComputeType* row_buf = buf[row_id];
-// #pragma unroll
-//       for (int pack_id = 0; pack_id < min_num_packs; ++pack_id) {
-//         const int col = (pack_id * thread_group_width + lane_id) * pack_size;
-//         const int pack_offset = pack_id * pack_size;
-//         load.template load<pack_size>(row_buf + pack_offset, row + row_id, col);
-// #pragma unroll
-//         for (int i = 0; i < pack_size; ++i) {
-//           WelfordCombine(row_buf[pack_offset + i], thread_mean + row_id, thread_m2 + row_id,
-//                          thread_count + row_id);
-//         }
-//       }
-//       for (int pack_id = min_num_packs; pack_id < max_num_packs; ++pack_id) {
-//         const int col = (pack_id * thread_group_width + lane_id) * pack_size;
-//         const int pack_offset = pack_id * pack_size;
-//         if (!padding || col < cols) {
-//           load.template load<pack_size>(row_buf + pack_offset, row + row_id, col);
-// #pragma unroll
-//           for (int i = 0; i < pack_size; ++i) {
-//             WelfordCombine(row_buf[pack_offset + i], thread_mean + row_id, thread_m2 + row_id,
-//                            thread_count + row_id);
-//           }
-//         } else {
-// #pragma unroll
-//           for (int i = 0; i < pack_size; ++i) { row_buf[pack_offset + i] = 0; }
-//         }
-//       }
-//     }
-//     ComputeType warp_mean[rows_per_access];
-//     ComputeType warp_m2[rows_per_access];
-//     ComputeType warp_count[rows_per_access];
-// #pragma unroll
-//     for (int row_id = 0; row_id < rows_per_access; ++row_id) {
-//       int global_row_id = row + row_id;
-//       ComputeType* row_buf = buf[row_id];
-//       WelfordWarpAllReduce<ComputeType, thread_group_width>(
-//           thread_mean[row_id], thread_m2[row_id], thread_count[row_id], warp_mean + row_id,
-//           warp_m2 + row_id, warp_count + row_id);
-//       ComputeType row_mean = warp_mean[row_id];
-//       ComputeType row_variance =
-//           max(Div(warp_m2[row_id], warp_count[row_id]), static_cast<ComputeType>(0.0));
-//       ComputeType row_inv_var = Rsqrt(row_variance + static_cast<ComputeType>(epsilon));
-//       if (lane_id == 0) {
-//         mean[global_row_id] = row_mean;
-//         inv_variance[global_row_id] = row_inv_var;
-//       }
-// #pragma unroll
-//       for (int i = 0; i < max_cols_per_thread; ++i) {
-//         row_buf[i] = (row_buf[i] - row_mean) * row_inv_var;
-//       }
-// #pragma unroll
-//       for (int i = 0; i < min_num_packs; ++i) {
-//         const int col = (i * thread_group_width + lane_id) * pack_size;
-//         store.template store<pack_size>(row_buf + i * pack_size, global_row_id, col);
-//       }
-// #pragma unroll
-//       for (int i = min_num_packs; i < max_num_packs; ++i) {
-//         const int col = (i * thread_group_width + lane_id) * pack_size;
-//         if (!padding || col < cols) {
-//           store.template store<pack_size>(row_buf + i * pack_size, global_row_id, col);
-//         }
-//       }
-//     }
-//   }
-// }
-
-__device__ int32_t threadHelper(){
-  return threadIdx.x; 
+__device__ __forceinline__ float FFMA_RZ(float a, float b, float c)
+{
+    float d;
+    asm ("fma.rz.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c));
+    return d;
 }
 
 template<typename LOAD, typename STORE, typename ComputeType, int pack_size,
          int max_cols_per_thread, int min_cols_per_thread, int thread_group_width,
          int rows_per_access, bool padding>
-__global__ void LayerNormWarpImpl(LOAD load, STORE store, const int32_t rows, const int32_t cols,
+__global__ void __launch_bounds__(256) LayerNormWarpImpl(LOAD load, STORE store, const int32_t rows, const int32_t cols,
                                   const double epsilon, ComputeType* mean,
                                   ComputeType* inv_variance) {
   static_assert(max_cols_per_thread % pack_size == 0, "");
@@ -561,7 +522,7 @@ __global__ void LayerNormWarpImpl(LOAD load, STORE store, const int32_t rows, co
   ComputeType buf[rows_per_access][max_cols_per_thread];
   const int32_t global_thread_group_id = blockIdx.x * blockDim.y + threadIdx.y;
   const int32_t num_global_thread_group = gridDim.x * blockDim.y;
-  // const int32_t lane_id = threadIdx.x;
+  const int32_t lane_id = threadIdx.x;
   const int32_t step = num_global_thread_group * rows_per_access;
   for (int32_t row = global_thread_group_id * rows_per_access; row < rows; row += step) {
     ComputeType thread_mean[rows_per_access];
@@ -575,8 +536,7 @@ __global__ void LayerNormWarpImpl(LOAD load, STORE store, const int32_t rows, co
       ComputeType* row_buf = buf[row_id];
 #pragma unroll
       for (int32_t pack_id = 0; pack_id < min_num_packs; ++pack_id) {
-        // const int32_t col = (pack_id * thread_group_width + lane_id) * pack_size;
-        const int32_t col = (pack_id * thread_group_width + threadHelper()) * pack_size;
+        const int32_t col = (pack_id * thread_group_width + lane_id) * pack_size;
 
         const int32_t pack_offset = pack_id * pack_size;
         load.template load<pack_size>(row_buf + pack_offset, row + row_id, col);
@@ -588,9 +548,7 @@ __global__ void LayerNormWarpImpl(LOAD load, STORE store, const int32_t rows, co
       }
       // todo unroll here. 
       for (int32_t pack_id = min_num_packs; pack_id < max_num_packs; ++pack_id) {
-        // const int32_t col = (pack_id * thread_group_width + lane_id) * pack_size;
-        const int32_t col = (pack_id * thread_group_width + threadHelper()) * pack_size;
-
+        const int32_t col = (pack_id * thread_group_width + lane_id) * pack_size;
         const int32_t pack_offset = pack_id * pack_size;
         if (!padding || col < cols) {
           load.template load<pack_size>(row_buf + pack_offset, row + row_id, col);
@@ -619,30 +577,26 @@ __global__ void LayerNormWarpImpl(LOAD load, STORE store, const int32_t rows, co
       ComputeType row_variance =
           max(Div(warp_m2[row_id], warp_count[row_id]), static_cast<ComputeType>(0.0));
       ComputeType row_inv_var = Rsqrt(row_variance + static_cast<ComputeType>(epsilon));
-      // if (lane_id == 0) {
-      //   mean[global_row_id] = row_mean;
-      //   inv_variance[global_row_id] = row_inv_var;
-      // }
-      if (threadHelper() == 0) {
+      
+      if (lane_id == 0) {
         mean[global_row_id] = row_mean;
         inv_variance[global_row_id] = row_inv_var;
       }
+      
 #pragma unroll
       for (int32_t i = 0; i < max_cols_per_thread; ++i) {
         row_buf[i] = (row_buf[i] - row_mean) * row_inv_var;
+        // row_mean = - row_mean * row_inv_var; 
+        // row_buf[i] = FFMA_RZ(row_buf[i], row_inv_var, row_mean); 
       }
 #pragma unroll
       for (int32_t i = 0; i < min_num_packs; ++i) {
-        // const int col = (i * thread_group_width + lane_id) * pack_size;
-        const int col = (i * thread_group_width + threadHelper()) * pack_size;
-
+        const int col = (i * thread_group_width + lane_id) * pack_size;
         store.template store<pack_size>(row_buf + i * pack_size, global_row_id, col);
       }
 #pragma unroll
       for (int32_t i = min_num_packs; i < max_num_packs; ++i) {
-        // const int col = (i * thread_group_width + lane_id) * pack_size;
-        const int col = (i * thread_group_width + threadHelper()) * pack_size;
-
+        const int col = (i * thread_group_width + lane_id) * pack_size;
         if (!padding || col < cols) {
           store.template store<pack_size>(row_buf + i * pack_size, global_row_id, col);
         }
@@ -651,10 +605,11 @@ __global__ void LayerNormWarpImpl(LOAD load, STORE store, const int32_t rows, co
   }
 }
 
+
 // template<typename LOAD, typename STORE, typename ComputeType, int pack_size,
 //          int max_cols_per_thread, int min_cols_per_thread, int thread_group_width,
 //          int rows_per_access, bool padding>
-// __global__ __launch_bounds__(128) void LayerNormWarpImpl(LOAD load, STORE store, const int64_t rows, const int64_t cols,
+// __global__ void __launch_bounds__(128) LayerNormWarpImpl(LOAD load, STORE store, const int64_t rows, const int64_t cols,
 //                                   const double epsilon, ComputeType* mean,
 //                                   ComputeType* inv_variance) {
 //   static_assert(max_cols_per_thread % pack_size == 0, "");
@@ -774,8 +729,14 @@ inline cudaError_t LaunchLayerNormWarpImpl(cudaStream_t stream, LOAD load, STORE
                                            const int64_t rows, const int64_t cols,
                                            const double epsilon, ComputeType* mean,
                                            ComputeType* inv_variance) {
-  constexpr int block_size = 128;
+  // constexpr int block_size = 128;
+  constexpr int block_size = 256;
+  // constexpr int block_size = 512;
+
   constexpr int waves = 32;
+  // constexpr int waves = 16;
+  // constexpr int waves = 1;
+
   static_assert(block_size % thread_group_width == 0, "");
   constexpr int thread_groups_per_block = block_size / thread_group_width;
   dim3 block_dim(thread_group_width, thread_groups_per_block);
